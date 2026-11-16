@@ -63,7 +63,7 @@ M.CHATS = {
                ["--ask-for-approval"] = true, ["--add-dir"] = true, ["-c"] = true,
                ["--config"] = true },
     switches = { ["--dangerously-bypass-approvals-and-sandbox"] = true,
-                 ["--search"] = true, ["--oss"] = true },
+                 ["--yolo"] = true, ["--search"] = true, ["--oss"] = true },
   },
 }
 
