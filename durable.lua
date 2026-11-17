@@ -17,6 +17,7 @@ Run it as a service with install.sh, or by hand:
   rex do durable.lua mode=status                  what is saved
   rex do durable.lua mode=save                    save now
   rex do durable.lua mode=reopen [dry_run=true]   reopen programs in their tabs
+  rex do durable.lua mode=repair [dry_run=true]   put back tabs that closed while Rex ran
   rex do durable.lua mode=checkpoint [name=NAME]  pin a copy of the latest save
   rex do durable.lua mode=rebuild [from=NAME]     rebuild saved sessions
   rex do durable.lua mode=version
@@ -25,7 +26,7 @@ https://github.com/fazxes/rex-durable (MIT License)
 ]]
 
 local M = {}
-M.VERSION = "0.1.0"
+M.VERSION = "0.2.0"
 
 local TERMINAL = "com.superlogical.terminal"
 local SHELL_FLAVOR = "com.superlogical.terminal.shell"
@@ -36,6 +37,12 @@ local MAX_AGE_DAYS = 30       -- older saves are never restored on their own
 local TYPE_DELAY = 0.4        -- seconds between reopened programs
 local SETTLE_TRIES = 10       -- tries while restored tabs finish starting their shells
 local SETTLE_WAIT = 3         -- seconds between those tries
+local HISTORY_EVERY = 600     -- seconds between copies kept in history/
+local HISTORY_KEEP = 144      -- copies kept: 24 hours
+local DROP_MIN = 3            -- a big drop loses at least this many tabs or chats...
+local DROP_KEEP = 0.6         -- ...and keeps at most this fraction of them
+local AUTO_PREFIX = "auto-before-drop-"
+local AUTO_KEEP = 10          -- automatic checkpoints kept
 
 local SHELLS = {
   bash = true, csh = true, dash = true, elvish = true, fish = true, ksh = true,
@@ -171,6 +178,7 @@ local STATE_DIR = args.state_dir
   or ((os.getenv("XDG_STATE_HOME") or (HOME .. "/.local/state")) .. "/rex-durable")
 local SNAP_DIR = STATE_DIR .. "/snapshots"
 local CHECKPOINT_DIR = STATE_DIR .. "/checkpoints"
+local HISTORY_DIR = STATE_DIR .. "/history"
 local STATE_FILE = STATE_DIR .. "/state.json"
 M.STATE_DIR = STATE_DIR
 
@@ -327,17 +335,50 @@ local function under(path, dir)
   return path:sub(1, #dir) == dir and path:sub(#dir + 1) or nil
 end
 
+local function first_line(path)
+  local f = io.open(path, "rb")
+  if not f then return nil end
+  local line = f:read("*l")
+  f:close()
+  return line
+end
+
+-- The chat that owns a subagent session, or nil for a main chat. A subagent's
+-- log starts with {"role":"child","parent":"<id>"}; fx won't resume it directly.
+function M.fx_parent(id, home, reader)
+  local line = (reader or first_line)((home or HOME) .. "/.fx/sessions/v2/" .. id .. "/log.jsonl")
+  local record = line and rex.json.decode(line)
+  if type(record) == "table" and record.role == "child" and type(record.parent) == "string"
+    and record.parent ~= "" then
+    return record.parent
+  end
+end
+
 -- fx holds ~/.fx/sessions/v2/<id>/lock (older: ~/.fx/sessions/<id>/session.lock).
-function M.fx_session(files, home)
+-- A chat that runs subagents also holds their locks, so prefer the main chat.
+function M.fx_session(files, home, reader)
+  local found = {}
   for _, f in ipairs(list(files)) do
     local rest = under(f, (home or HOME) .. "/.fx/sessions/")
     if rest then
       local id = rest:match("^v2/([%w_%-]+)/lock$")
-      if id then return id, "v2" end
+      if id then found[#found + 1] = { id, "v2" } end
       id = rest:match("^([%w_%-]+)/session%.lock$")
-      if id then return id, "v1" end
+      if id then found[#found + 1] = { id, "v1" } end
     end
   end
+  if #found == 0 then return nil end
+  for _, chat in ipairs(found) do
+    if chat[2] ~= "v2" or not M.fx_parent(chat[1], home, reader) then return chat[1], chat[2] end
+  end
+  -- Only subagent locks: follow the owners up to the main chat.
+  local id = found[1][1]
+  for _ = 1, 5 do
+    local parent = M.fx_parent(id, home, reader)
+    if not parent then break end
+    id = parent
+  end
+  return id, "v2"
 end
 
 -- Codex writes ~/.codex/sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl.
@@ -584,7 +625,7 @@ M.collect = collect
 ---------------------------------------------------------------------------
 -- Saves
 
-local function ensure_dirs() run({ "mkdir", "-p", SNAP_DIR, CHECKPOINT_DIR }) end
+local function ensure_dirs() run({ "mkdir", "-p", SNAP_DIR, CHECKPOINT_DIR, HISTORY_DIR }) end
 
 local function snapshot_path(instance) return SNAP_DIR .. "/" .. instance .. ".json" end
 
@@ -599,15 +640,6 @@ local function load_snapshots()
   end
   table.sort(out, function(a, b) return a.saved_at > b.saved_at end)
   return out
-end
-
-local function save()
-  ensure_dirs()
-  local snap = collect()
-  write_json(snapshot_path(snap.server.instance_id), snap)
-  local all = load_snapshots()
-  for i = KEEP_SNAPSHOTS + 1, #all do os.remove(all[i].path) end
-  return snap
 end
 
 local function checkpoint_path(name)
@@ -671,6 +703,78 @@ function M.summary(snap)
   local text = string.format("%d sessions, %d tabs, %d chats", sessions, tabs, chats)
   if #parts > 0 then text = text .. " (" .. table.concat(parts, ", ") .. ")" end
   return text .. string.format(", %d other programs", programs), chats, programs
+end
+
+function M.counts(snap)
+  local tabs, chats = 0, 0
+  for _, s in ipairs(list(snap and snap.sessions)) do
+    for _, w in ipairs(list(s.windows)) do
+      tabs = tabs + 1
+      for _, p in ipairs(M.panes(w.layout)) do
+        if p.kind == "chat" then chats = chats + 1 end
+      end
+    end
+  end
+  return { tabs = tabs, chats = chats }
+end
+
+-- Many tabs or chats gone between two saves of the same server: something
+-- closed them all at once, not a person closing tabs one by one.
+function M.big_drop(before, after)
+  local a, b = M.counts(before), M.counts(after)
+  local lost_tabs, lost_chats = a.tabs - b.tabs, a.chats - b.chats
+  return (lost_tabs >= DROP_MIN and b.tabs <= a.tabs * DROP_KEEP)
+    or (lost_chats >= DROP_MIN and b.chats <= a.chats * DROP_KEEP)
+end
+
+local function stamp_time(name)
+  local y, mo, d, h, mi, s = name:match("(%d%d%d%d)(%d%d)(%d%d)%-(%d%d)(%d%d)(%d%d)")
+  if not y then return 0 end
+  return os.time({ year = tonumber(y), month = tonumber(mo), day = tonumber(d),
+                   hour = tonumber(h), min = tonumber(mi), sec = tonumber(s) })
+end
+
+local function keep_newest(paths, n)
+  table.sort(paths)
+  for i = 1, #paths - n do os.remove(paths[i]) end
+end
+
+-- A copy every HISTORY_EVERY seconds, so an older save survives later ones.
+local function add_history(snap)
+  local copies = list_dir(HISTORY_DIR, ".json")
+  table.sort(copies)
+  local newest = copies[#copies]
+  if newest and os.time() - stamp_time(basename(newest)) < HISTORY_EVERY then return end
+  write_json(HISTORY_DIR .. "/" .. os.date("%Y%m%d-%H%M%S") .. ".json", snap)
+  keep_newest(list_dir(HISTORY_DIR, ".json"), HISTORY_KEEP)
+end
+
+local function save()
+  ensure_dirs()
+  local snap = collect()
+  local path = snapshot_path(snap.server.instance_id)
+  local before = read_json(path)
+  if type(before) == "table" and M.big_drop(before, snap) then
+    -- Keep the save from just before, where later saves can't replace it.
+    local name = AUTO_PREFIX .. os.date("%Y%m%d-%H%M%S")
+    write_json(checkpoint_path(name), before)
+    local auto = {}
+    for _, p in ipairs(list_dir(CHECKPOINT_DIR, ".json")) do
+      if basename(p):sub(1, #AUTO_PREFIX) == AUTO_PREFIX then auto[#auto + 1] = p end
+    end
+    keep_newest(auto, AUTO_KEEP)
+    local a, b = M.counts(before), M.counts(snap)
+    log(string.format("%d tabs and %d chats closed at once (%d -> %d tabs); kept the save from " ..
+                      "before as checkpoint %s. Run mode=repair to bring them back.",
+                      a.tabs - b.tabs, a.chats - b.chats, a.tabs, b.tabs, name))
+    notify(string.format("%d Rex tabs closed at once. rex-durable kept a copy. " ..
+                         "To bring them back, run Repair Missing Tabs.", a.tabs - b.tabs))
+  end
+  write_json(path, snap)
+  add_history(snap)
+  local all = load_snapshots()
+  for i = KEEP_SNAPSHOTS + 1, #all do os.remove(all[i].path) end
+  return snap
 end
 
 ---------------------------------------------------------------------------
@@ -877,10 +981,10 @@ end
 -- Tabs Rex has just restored are still starting their shells, and a shell's
 -- startup can run commands that make the tab look busy. Try again for a while;
 -- a tab is typed into at most once.
-local function reopen(saved, live, dry_run)
+local function reopen(saved, live, dry_run, tries)
   local written, typed = {}, {}
   local chats, programs = 0, 0
-  local tries = dry_run and 1 or SETTLE_TRIES
+  tries = (dry_run and 1) or tries or SETTLE_TRIES
   for try = 1, tries do
     if try > 1 then
       rex.sleep(SETTLE_WAIT)
@@ -937,57 +1041,208 @@ local function create_layout(node, open, leaves)
   return { block = block }
 end
 
+-- Create one saved session, with all its windows. Returns its new ID.
+local function rebuild_session(s, open)
+  local windows, leaves_by_window = {}, {}
+  for i, w in ipairs(s.windows) do
+    local leaves = {}
+    local window = { layout = create_layout(w.layout, open, leaves) }
+    if w.label then window.label = w.label end
+    windows[i], leaves_by_window[i] = window, leaves
+  end
+  local request = { initial_windows = windows }
+  if s.label then request.label = s.label end
+  local result, err = rex.call("session.create", request)
+  if not result and request.label then
+    -- The name may be taken; keep the session under a new one.
+    request.label = request.label .. " (restored)"
+    result, err = rex.call("session.create", request)
+  end
+  if result then
+    log("  rebuilt session " .. tostring(s.label))
+    rex.session.attach{ session_id = result.session_id }
+    -- Focus each window's focused pane, then the window that was active.
+    local active_block
+    for i, made_window in ipairs(list(result.initial_windows)) do
+      local focused = 1
+      for j, p in ipairs(leaves_by_window[i] or {}) do if p.focused then focused = j end end
+      local block_id = list(made_window.block_ids)[focused]
+      if block_id then
+        rex.session.focus_block{ session_id = result.session_id, block_id = block_id }
+        if s.windows[i].active then active_block = block_id end
+      end
+    end
+    if active_block then
+      rex.session.focus_block{ session_id = result.session_id, block_id = active_block }
+    end
+    rex.sleep(TYPE_DELAY)
+    return result.session_id, result
+  end
+  log("  couldn't rebuild session " .. tostring(s.label) .. ": " .. tostring(err))
+end
+
 local function rebuild(saved, live)
   local open = open_chats(saved, live)
   local made = 0
   for _, s in ipairs(list(saved.sessions)) do
-    if not M.is_default_session(s) and #list(s.windows) > 0 then
-      local windows, leaves_by_window = {}, {}
-      for i, w in ipairs(s.windows) do
-        local leaves = {}
-        local window = { layout = create_layout(w.layout, open, leaves) }
-        if w.label then window.label = w.label end
-        windows[i], leaves_by_window[i] = window, leaves
-      end
-      local request = { initial_windows = windows }
-      if s.label then request.label = s.label end
-      local result, err = rex.call("session.create", request)
-      if not result and request.label then
-        -- The name may be taken; keep the session under a new one.
-        request.label = request.label .. " (restored)"
-        result, err = rex.call("session.create", request)
-      end
-      if result then
-        made = made + 1
-        log("  rebuilt session " .. tostring(s.label))
-        rex.session.attach{ session_id = result.session_id }
-        -- Focus each window's focused pane, then the window that was active.
-        local active_block
-        for i, made_window in ipairs(list(result.initial_windows)) do
-          local focused = 1
-          for j, p in ipairs(leaves_by_window[i] or {}) do if p.focused then focused = j end end
-          local block_id = list(made_window.block_ids)[focused]
-          if block_id then
-            rex.session.focus_block{ session_id = result.session_id, block_id = block_id }
-            if s.windows[i].active then active_block = block_id end
-          end
-        end
-        if active_block then
-          rex.session.focus_block{ session_id = result.session_id, block_id = active_block }
-        end
-        rex.sleep(TYPE_DELAY)
-      else
-        log("  couldn't rebuild session " .. tostring(s.label) .. ": " .. tostring(err))
-      end
+    if not M.is_default_session(s) and #list(s.windows) > 0 and rebuild_session(s, open) then
+      made = made + 1
     end
   end
   return made
 end
 
 ---------------------------------------------------------------------------
--- Modes
+-- Repairing tabs that closed while the server kept running
 
 local function read_state() return read_json(STATE_FILE) or {} end
+
+-- What is missing from Rex compared with a save: whole sessions, and tabs of
+-- sessions that still exist. A tab counts as there if any of its blocks is, if
+-- an earlier repair put it back (`repaired` maps saved IDs to new ones), or if
+-- every chat in it is already open somewhere else.
+function M.plan_repair(saved, live, open, repaired)
+  repaired = repaired or {}
+  local by_id, by_label, blocks, windows = {}, {}, {}, {}
+  for _, s in ipairs(list(live.sessions)) do
+    by_id[s.session_id] = s
+    by_label[s.label or ""] = by_label[s.label or ""] or s
+    for _, w in ipairs(list(s.windows)) do
+      if w.window_id then windows[w.window_id] = true end
+      for _, p in ipairs(M.panes(w.layout)) do blocks[p.block_id] = true end
+    end
+  end
+  local actions = {}
+  for _, s in ipairs(list(saved.sessions)) do
+    if not M.is_default_session(s) and #list(s.windows) > 0 then
+      local target = by_id[s.session_id] or by_id[repaired[s.session_id] or ""] or by_label[s.label or ""]
+      if not target then
+        actions[#actions + 1] = { kind = "session", saved = s }
+      else
+        for wi, w in ipairs(list(s.windows)) do
+          local again = w.window_id and repaired[w.window_id]
+          local present, chats, open_count = again ~= nil and windows[again] == true, 0, 0
+          for _, p in ipairs(M.panes(w.layout)) do
+            if blocks[p.block_id] then present = true end
+            if p.kind == "chat" then
+              chats = chats + 1
+              if open[p.app .. ":" .. tostring(p.id)] then open_count = open_count + 1 end
+            end
+          end
+          if not present and not (chats > 0 and open_count == chats) then
+            actions[#actions + 1] = { kind = "window", session_id = target.session_id,
+                                      label = s.label, saved = w, index = wi, session = s }
+          end
+        end
+      end
+    end
+  end
+  return actions
+end
+
+-- Put every saved window of a session back in the saved order. Windows that
+-- the save doesn't have go after them.
+local function reorder_windows(session_id, saved_session, made)
+  rex.session.attach{ session_id = session_id }
+  local view = rex.session.view{ session_id = session_id }
+  if not view then return end
+  local window_of = {}
+  for _, w in ipairs(list(view.windows)) do
+    for _, layer in ipairs(list(w.layers)) do
+      for _, b in ipairs(list(layer.blocks)) do window_of[b.block_id] = w.window_id end
+    end
+  end
+  local ordered, used = {}, {}
+  for wi, w in ipairs(list(saved_session.windows)) do
+    local id = made[wi]
+    if not id then
+      for _, p in ipairs(M.panes(w.layout)) do id = id or window_of[p.block_id] end
+    end
+    if id and not used[id] then ordered[#ordered + 1] = id; used[id] = true end
+  end
+  for _, w in ipairs(list(view.windows)) do
+    if not used[w.window_id] then ordered[#ordered + 1] = w.window_id end
+  end
+  for _, id in ipairs(ordered) do
+    rex.call("session.move_window", { session_id = session_id, window_id = id })
+  end
+end
+
+local function repair(saved, dry_run)
+  -- First, chats whose tab is still there but whose program stopped.
+  local live = collect()
+  local chats, programs = reopen(saved, live, dry_run, 1)
+  live = collect()
+  local open = open_chats(saved, live)
+  local state = read_state()
+  state.repaired = state.repaired or {}
+  local actions = M.plan_repair(saved, live, open, state.repaired)
+  local tabs, sessions, made, touched = 0, 0, {}, {}
+  for _, a in ipairs(actions) do
+    if a.kind == "session" then
+      log(string.format("  %s session %s (%d tabs)", dry_run and "would rebuild" or "rebuild",
+                        tostring(a.saved.label), #list(a.saved.windows)))
+      if not dry_run then
+        local new_id, result = rebuild_session(a.saved, open)
+        if new_id then
+          sessions = sessions + 1
+          state.repaired[a.saved.session_id] = new_id
+          for i, w in ipairs(list(result.initial_windows)) do
+            local saved_window = list(a.saved.windows)[i]
+            if saved_window and saved_window.window_id and w.window_id then
+              state.repaired[saved_window.window_id] = w.window_id
+            end
+          end
+        end
+      end
+    else
+      log(string.format("  %s %s tab %d", dry_run and "would add" or "add", tostring(a.label), a.index))
+      if not dry_run then
+        rex.session.attach{ session_id = a.session_id }
+        local layout = create_layout(a.saved.layout, open, {})
+        local request = { session_id = a.session_id, layout = layout, focus = false }
+        if a.saved.label then request.window_label = a.saved.label end
+        local result, err = rex.call("session.new_window", request)
+        if result then
+          tabs = tabs + 1
+          made[a.session_id] = made[a.session_id] or {}
+          made[a.session_id][a.index] = result.window_id
+          if a.saved.window_id then state.repaired[a.saved.window_id] = result.window_id end
+          touched[a.session_id] = a.session
+          rex.sleep(TYPE_DELAY)
+        else
+          log("  couldn't add the tab: " .. tostring(err))
+        end
+      end
+    end
+  end
+  if not dry_run then
+    write_json(STATE_FILE, state)
+    for session_id, saved_session in pairs(touched) do
+      reorder_windows(session_id, saved_session, made[session_id] or {})
+    end
+    -- Sessions keep their saved order; sessions the save doesn't have go after them.
+    local current = {}
+    for _, s in ipairs(list((rex.call("session.list") or {}).sessions)) do current[s.label or ""] = s.session_id end
+    if sessions > 0 then
+      local moved = {}
+      for _, s in ipairs(list(saved.sessions)) do
+        local id = current[s.label or ""]
+        if id and not moved[id] then
+          rex.call("session.move", { session_id = id })
+          moved[id] = true
+        end
+      end
+      for _, s in ipairs(list((rex.call("session.list") or {}).sessions)) do
+        if not moved[s.session_id] then rex.call("session.move", { session_id = s.session_id }) end
+      end
+    end
+  end
+  return chats, programs, tabs, sessions
+end
+
+---------------------------------------------------------------------------
+-- Modes
 
 -- Print a result; actions from the command palette also show it as a notification.
 local function tell(message)
@@ -1140,6 +1395,34 @@ local function main()
     end
     return
   end
+  if mode == "repair" then
+    local saved, from = nil, args.from
+    if from then
+      saved = load_source(from)
+    else
+      -- The newest copy kept from before many tabs closed at once, else the latest save.
+      local auto = {}
+      for _, p in ipairs(list_dir(CHECKPOINT_DIR, ".json")) do
+        if basename(p):sub(1, #AUTO_PREFIX) == AUTO_PREFIX then auto[#auto + 1] = p end
+      end
+      table.sort(auto)
+      if #auto > 0 then
+        saved = read_json(auto[#auto])
+        from = basename(auto[#auto]):gsub("%.json$", "")
+      else
+        saved = load_snapshots()[1]
+        from = "the latest save"
+      end
+    end
+    if not saved then print("No save to repair from.") return end
+    print(string.format("Repairing from %s (saved %s): %s", from, tostring(saved.saved_at), (M.summary(saved))))
+    local chats, programs, tabs, sessions = repair(saved, args.dry_run == true)
+    if args.dry_run ~= true then
+      tell(string.format("Added %d tabs and %d sessions; reopened %d chats; typed %d other programs.",
+                         tabs, sessions, chats, programs))
+    end
+    return
+  end
   if mode == "rebuild" then
     local live = collect()
     local saved = args.from and load_source(args.from) or previous_snapshot(live.server.instance_id)
@@ -1153,7 +1436,7 @@ local function main()
     return
   end
   error("unknown mode " .. tostring(mode) ..
-        "; use watch, status, save, reopen, checkpoint, rebuild, or version", 0)
+        "; use watch, status, save, reopen, repair, checkpoint, rebuild, or version", 0)
 end
 
 -- For the tests: the helpers that read processes and files.

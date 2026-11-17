@@ -46,6 +46,8 @@ rex do "$S" mode=status                    # what is saved, and the last restore
 rex do "$S" mode=save                      # save now
 rex do "$S" mode=reopen dry_run=true       # show what a reopen would type
 rex do "$S" mode=reopen                    # reopen programs in their tabs
+rex do "$S" mode=repair dry_run=true       # show which closed tabs a repair would put back
+rex do "$S" mode=repair                    # put back tabs that closed while Rex kept running
 rex do "$S" mode=checkpoint name=before-update
 rex do "$S" mode=reopen from=before-update # reopen from a pinned checkpoint
 rex do "$S" mode=rebuild from=before-update yes=true  # recreate saved sessions
@@ -55,17 +57,30 @@ The command palette has the same actions: search for "durable".
 
 Add `programs=false` to any mode to reopen chats only, and never type other programs' commands.
 
+### If many tabs close at once
+
+Sometimes every tab closes while Rex keeps running: a crash, or a command that kills the wrong processes. Rex then has nothing to bring back, because its server never restarted.
+
+rex-durable notices when a save loses most of the tabs or chats of the save before it. It keeps that earlier save as a checkpoint named `auto-before-drop-<time>`, which later saves never replace, and shows a notification. To put the tabs back:
+
+```sh
+rex do "$S" mode=repair dry_run=true   # check what it will add
+rex do "$S" mode=repair                # add it
+```
+
+Or run **Repair Missing Tabs** from the command palette. Repair adds each missing tab with its splits, in its old place in the session, and recreates missing sessions. It reopens chats in them, never a chat that is already open, and running it again adds nothing. Add `from=NAME` to repair from another checkpoint.
+
 ## How it works
 
 `durable.lua` is a [Rex Lua script](https://www.superlogical.com/rex/docs/automate/lua-scripts). The service runs it with `rex do durable.lua --all`, which hears events from every session. It uses only Rex's public API:
 
 - **Watching.** On a timer (`rex.every`) and after layout and terminal events (`rex.on`), it starts a short `rex do durable.lua mode=save`. Each save runs on its own connection, so reading every session never affects the watcher.
 - **Saving.** For each tab, it records the block ID, the folder, and the program from the terminal's `process` method. It then works out which conversation each chat is on:
-  - **fx** holds a lock file for its session (`~/.fx/sessions/v2/<id>/lock`).
+  - **fx** holds a lock file for its session (`~/.fx/sessions/v2/<id>/lock`). A chat that runs subagents holds their locks too. rex-durable always saves the main chat, because fx can't reopen a subagent on its own.
   - **Codex** keeps its rollout file open (`~/.codex/sessions/…/rollout-…-<id>.jsonl`), or the ID is on its command line (`codex resume <id>`).
   - **Claude Code** names the session on its command line (`--resume <id>`). Otherwise rex-durable uses the newest session file for that folder written since the chat started. If two such chats share a folder, it can't tell them apart, so they come back typed, not run.
 
-  Saves go to `~/Library/Application Support/rex-durable/` on macOS, or `~/.local/state/rex-durable/` on Linux. It keeps the last save of each of the latest 10 servers.
+  Saves go to `~/Library/Application Support/rex-durable/` on macOS, or `~/.local/state/rex-durable/` on Linux. It keeps the last save of each of the latest 10 servers, a copy every 10 minutes for the last 24 hours in `history/`, and the 10 newest automatic checkpoints.
 - **Restoring.** When the watcher connects to a server instance it hasn't seen, it takes the last save from the previous server. Rex restores its own sessions with the same block IDs, so each program goes back into exactly the tab it came from, by block ID first and then by session name and position. If the server starts empty, for example after `rex server stop --discard`, rex-durable creates the saved sessions itself.
 
 ## Safety
@@ -75,7 +90,8 @@ Add `programs=false` to any mode to reopen chats only, and never type other prog
 - It acts once per server start. Running it again on the same server only saves.
 - Programs other than chats are typed, never run.
 - Saves older than 30 days are never restored on their own.
-- `dry_run=true` shows what a reopen would type, without typing it.
+- When many tabs close at once, the save from before is kept as a checkpoint, so it can't be lost.
+- `dry_run=true` shows what a reopen or a repair would do, without doing it.
 
 ## Limits
 

@@ -27,6 +27,65 @@ end
 local function new_fx(_, option) return option ~= "--sessions-v2" end
 local function old_fx() return true end
 
+-- A chat that runs subagents holds their locks too: save the main chat.
+local function reader(path)
+  if path:find("/SUB1/", 1, true) then return '{"kind":"session_created","id":"SUB1","role":"child","parent":"MAIN1"}' end
+  if path:find("/SUB2/", 1, true) then return '{"kind":"session_created","id":"SUB2","role":"child","parent":"SUB1"}' end
+  return '{"kind":"session_created","role":"root"}'
+end
+local v2 = HOME .. "/.fx/sessions/v2/"
+check("main chat wins over its subagent",
+  { M.fx_session({ v2 .. "SUB1/lock", v2 .. "MAIN1/lock" }, nil, reader) }, { "MAIN1", "v2" })
+check("only subagent locks: follow the owners to the main chat",
+  { M.fx_session({ v2 .. "SUB2/lock" }, nil, reader) }, { "MAIN1", "v2" })
+check("no log: a main chat", { M.fx_session({ v2 .. "PLAIN/lock" }, nil, function() return nil end) }, { "PLAIN", "v2" })
+
+-- Many tabs closed at once
+local function snap_with(tabs, chats)
+  local windows = {}
+  for i = 1, tabs do
+    windows[i] = { layout = { pane = { kind = i <= chats and "chat" or "shell", app = "fx", id = "C" .. i } } }
+  end
+  return { sessions = { { label = "s", windows = windows } } }
+end
+check("big drop: most tabs gone", M.big_drop(snap_with(10, 8), snap_with(2, 1)), true)
+check("no drop: one tab closed", M.big_drop(snap_with(10, 8), snap_with(9, 7)), false)
+check("no drop: only two tabs gone", M.big_drop(snap_with(3, 3), snap_with(1, 1)), false)
+check("big drop: chats stopped, tabs stayed", M.big_drop(snap_with(10, 8), snap_with(10, 2)), true)
+
+-- Repair: what is missing compared with a save
+local saved_r = { sessions = {
+  { session_id = "s1", label = "work", windows = {
+    { layout = { pane = { block_id = "k1", kind = "chat", app = "fx", id = "A" } } },
+    { layout = { pane = { block_id = "k2", kind = "shell", cwd = "/w" } } },
+    { layout = { pane = { block_id = "k3", kind = "chat", app = "fx", id = "B" } } },
+  } },
+  { session_id = "gone", label = "old", windows = {
+    { layout = { pane = { block_id = "k9", kind = "shell", cwd = "/w" } } },
+  } },
+} }
+local live_r = { sessions = { { session_id = "s1", label = "work", windows = {
+  { layout = { pane = { block_id = "k1", kind = "chat", app = "fx", id = "A" } } },
+} } } }
+local function actions(open)
+  local out = {}
+  for _, a in ipairs(M.plan_repair(saved_r, live_r, open)) do
+    out[#out + 1] = a.kind == "session" and ("session " .. a.saved.label) or (a.label .. " tab " .. a.index)
+  end
+  return out
+end
+check("repair adds missing tabs and sessions", actions({}), { "work tab 2", "work tab 3", "session old" })
+check("repair skips a tab whose chat is open elsewhere", actions({ ["fx:B"] = true }), { "work tab 2", "session old" })
+-- A tab an earlier repair put back has new IDs; the record of it counts.
+saved_r.sessions[1].windows[2].window_id = "window:saved-2"
+table.insert(live_r.sessions[1].windows, { window_id = "window:new-2",
+  layout = { pane = { block_id = "k2-new", kind = "shell", cwd = "/w" } } })
+local again = {}
+for _, a in ipairs(M.plan_repair(saved_r, live_r, {}, { ["window:saved-2"] = "window:new-2" })) do
+  again[#again + 1] = a.kind == "session" and ("session " .. a.saved.label) or (a.label .. " tab " .. a.index)
+end
+check("repair doesn't add a tab it already put back", again, { "work tab 3", "session old" })
+
 -- ps and lsof output
 check("etime seconds", M.parse_etime("05:07"), 307)
 check("etime hours", M.parse_etime("1:02:03"), 3723)
