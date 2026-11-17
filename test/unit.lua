@@ -1,9 +1,14 @@
 -- Unit tests for durable.lua. They run in Rex's own Lua and only read:
 --
---   rex do test/unit.lua            (from the repository root)
+--   rex do test/unit.lua root="$PWD"     (from the repository root)
+--
+-- test/e2e.sh runs them for you.
 
 REX_DURABLE_LIB = true
-local here = (debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]*$")) or "."
+-- Test this repository's durable.lua. A `rex do` script can't always see its
+-- own path, and the current folder may be another checkout, so the caller
+-- passes the repository with root=.
+local here = rex.args.root or (debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]*$")) or "."
 local M = dofile(here .. "/durable.lua")
 local HOME = os.getenv("HOME")
 

@@ -102,7 +102,8 @@ CODEX_ID=11111111-2222-4333-8444-555555555555
 
 echo "0. Unit tests"
 start_server
-if R do "$here/test/unit.lua" >"$T/unit.log" 2>&1; then ok "$(tail -1 "$T/unit.log")"; else cat "$T/unit.log"; bad "unit tests"; fi
+# From another folder, so the tests prove they load this repository's durable.lua.
+if (cd / && R do "$here/test/unit.lua" "root=$here") >"$T/unit.log" 2>&1; then ok "$(tail -1 "$T/unit.log")"; else cat "$T/unit.log"; bad "unit tests"; fi
 if [ "${1:-}" = "--unit" ]; then echo; echo "$passed passed, $failed failed"; [ "$failed" = 0 ]; exit; fi
 
 echo "1. Save what runs in each tab"

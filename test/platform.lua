@@ -2,7 +2,7 @@
 -- plain Lua 5.1 and no Rex: a stand-in rex.exec runs commands with io.popen.
 -- Used on Linux, where Rex itself may not be installed:
 --
---   lua5.1 test/platform.lua
+--   lua5.1 test/platform.lua [REPOSITORY]
 
 local function quote(word) return "'" .. tostring(word):gsub("'", "'\\''") .. "'" end
 
@@ -25,7 +25,7 @@ rex = {
 }
 
 REX_DURABLE_LIB = true
-local here = (debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]*$")) or "."
+local here = (arg and arg[1]) or (debug.getinfo(1, "S").source:match("^@(.*)/test/[^/]*$")) or "."
 local M = dofile(here .. "/durable.lua")
 
 local passed, failed = 0, 0
