@@ -27,6 +27,14 @@ rex.action{
 }
 
 rex.action{
+  name = "durable_repair",
+  title = "Repair Missing Tabs",
+  category = "rex-durable",
+  keywords = "durable repair restore missing closed tabs sessions chats",
+  run = function() start("repair") end,
+}
+
+rex.action{
   name = "durable_save",
   title = "Save Open Programs Now",
   category = "rex-durable",

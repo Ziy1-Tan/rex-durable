@@ -28,10 +28,23 @@ static void make_dirs(const char *path) {
   mkdir(buf, 0755);
 }
 
+/* Writes one line to a new file; leaves an existing file alone. */
+static void write_new(const char *path, const char *line) {
+  int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+  if (fd < 0) return;
+  if (write(fd, line, strlen(line)) < 0) {
+  }
+  close(fd);
+}
+
 int main(int argc, char **argv) {
   const char *app = APP;
-  char id[128] = "";
+  char id[128] = "", child[128] = "";
   for (int i = 1; i < argc; i++) {
+    if (!strcmp(argv[i], "--child") && i + 1 < argc) {
+      snprintf(child, sizeof child, "%s", argv[++i]);
+      continue;
+    }
     if (!strcmp(argv[i], "--help")) {
       printf("usage: %s [-r, --resume [last|<id>]]\n", app);
       return 0;
@@ -51,6 +64,19 @@ int main(int argc, char **argv) {
   if (!getcwd(cwd, sizeof cwd)) return 1;
   int keep_open = 1;
   if (!strcmp(app, "fx")) {
+    if (child[0]) {
+      /* Like fx running a subagent: it holds the subagent's lock too, and the
+         subagent's log names its owner. Opened first, so it is listed first. */
+      char cdir[4096], cfile[4608], line[512];
+      snprintf(cdir, sizeof cdir, "%s/.fx/sessions/v2/%s", FAKE_HOME, child);
+      make_dirs(cdir);
+      snprintf(cfile, sizeof cfile, "%s/log.jsonl", cdir);
+      snprintf(line, sizeof line, "{\"kind\":\"session_created\",\"id\":\"%s\",\"role\":\"child\",\"parent\":\"%s\"}\n",
+               child, id);
+      write_new(cfile, line);
+      snprintf(cfile, sizeof cfile, "%s/lock", cdir);
+      if (open(cfile, O_WRONLY | O_CREAT, 0644) < 0) return 1;
+    }
     snprintf(dir, sizeof dir, "%s/.fx/sessions/v2/%s", FAKE_HOME, id);
     snprintf(file, sizeof file, "%s/lock", dir);
   } else if (!strcmp(app, "codex")) {

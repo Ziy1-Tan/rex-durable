@@ -63,12 +63,19 @@ stop_server() {
   fi
   sleep 1
 }
-cleanup() {
+# Stop only what this test started, by PID: never by a name pattern.
+stop_watcher() {
   rm -f "$T/supervise"
-  [ -n "$watch_pid" ] && kill "$watch_pid" 2>/dev/null || true
-  pkill -f "state_dir=$T/durable" 2>/dev/null || true
+  if [ -f "$T/watch.pid" ]; then kill "$(cat "$T/watch.pid")" 2>/dev/null || true; fi
+  if [ -n "$watch_pid" ]; then kill "$watch_pid" 2>/dev/null || true; wait "$watch_pid" 2>/dev/null || true; fi
+  watch_pid=""
+}
+cleanup() {
+  stop_watcher
   stop_server
-  pkill -f "$T/bin/" 2>/dev/null || true
+  # The fake chats end with their server. Stop any left over: only processes
+  # whose program is in this test's own folder.
+  for p in $(pgrep -f "^$T/bin/" || true); do kill "$p" 2>/dev/null || true; done
   if [ "$failed" -gt 0 ] || [ "${KEEP:-0}" = 1 ]; then
     echo "Kept the test folder for a look: $T"
   else
@@ -172,8 +179,11 @@ echo "5. The watcher, kept running like a login service, brings programs back by
 touch "$T/supervise"
 (
   while [ -e "$T/supervise" ]; do
-    HOME="$H" R do "$here/durable.lua" --all mode=watch "rex=$REX" "script=$here/durable.lua" \
-      "server=$SOCK" "state_dir=$T/durable" notify=false >>"$T/watch.log" 2>&1 || true
+    env -u REX_SESSION -u REX_BLOCK -u REX_SERVER -u REX_CLIENT -u REX_CONFIG HOME="$H" \
+      "$REX" --autostart=false -S "$SOCK" do "$here/durable.lua" --all mode=watch "rex=$REX" \
+      "script=$here/durable.lua" "server=$SOCK" "state_dir=$T/durable" notify=false >>"$T/watch.log" 2>&1 &
+    echo $! >"$T/watch.pid"
+    wait $! || true
     sleep 1
   done
 ) &
@@ -198,14 +208,43 @@ expect "claude chat back" has_line "^work 2\.1 chat claude $CLAUDE_ID "
 expect "side session's chat back" has_line '^side 1\.1 chat fx FXB '
 expect "one copy of each chat" test "$(running "$T/bin/fx --resume FXA")" = 1
 rm -f "$T/supervise"
-pkill -f "state_dir=$T/durable" 2>/dev/null || true
-wait "$watch_pid" 2>/dev/null || true
-watch_pid=""
+stop_watcher
 
 echo "6. The command palette actions load"
 sed -e "s|@REX@|$REX|" -e "s|@SCRIPT@|$here/durable.lua|" "$here/rex_durable.lua" >"$T/rex_durable.lua"
 printf 'package.path = "%s/?.lua;" .. package.path\nrequire("rex_durable")\n' "$T" >"$T/check.lua"
 expect "rex config check passes" sh -c "'$REX' config check '$T/check.lua' >'$T/check.log' 2>&1"
+
+echo "7. Many tabs close at once while Rex keeps running"
+HOME="$H" R do "$here/test/e2e_more.lua" action=sub "bin=$T/bin" "dir=$T/my proj" >/dev/null
+sleep 2
+D mode=save
+listing=$(show)
+expect "a chat that runs a subagent is saved as the main chat" has_line '^sub 1\.1 chat fx FXP '
+before_panes=$(printf '%s\n' "$listing" | grep -c '^work ')
+HOME="$H" R do "$here/test/e2e_more.lua" action=close label=work >/dev/null
+sleep 2
+expect "the closed tabs' chats stopped" test "$(running "$T/bin/fx --resume FXA")" = 0
+D mode=save >"$T/drop.log"
+expect "the drop is noticed" grep -q 'closed at once' "$T/drop.log"
+expect "a copy from before the drop is kept" sh -c "ls '$T/durable/checkpoints'/auto-before-drop-*.json >/dev/null"
+D mode=repair dry_run=true >"$T/repair-dry.log"
+expect "a dry run lists the missing tabs" grep -q 'would add work tab 1' "$T/repair-dry.log"
+expect "a dry run opens nothing" test "$(running "$T/bin/fx --resume FXA")" = 0
+D mode=repair >"$T/repair.log"
+sleep 4
+D mode=save
+listing=$(show)
+expect "repair brings back the fx chat" has_line '^work 1\.1 chat fx FXA '
+expect "repair brings back the codex split" has_line "^work 1\.2 chat codex $CODEX_ID "
+expect "repair brings back the claude chat" has_line "^work 2\.1 chat claude $CLAUDE_ID "
+expect "repair brings back every pane" test "$(printf '%s\n' "$listing" | grep -c '^work ')" = "$before_panes"
+expect "repair opens each chat once" test "$(running "$T/bin/fx --resume FXA")" = 1
+expect "the subagent's chat was not touched" test "$(running "$T/bin/fx --resume FXP --child SUBC1")" = 1
+D mode=repair >"$T/repair2.log"
+sleep 2
+expect "a second repair adds nothing" grep -q 'Added 0 tabs and 0 sessions' "$T/repair2.log"
+expect "still one copy of each chat" test "$(running "$T/bin/fx --resume FXA")" = 1
 
 echo
 echo "$passed passed, $failed failed"
