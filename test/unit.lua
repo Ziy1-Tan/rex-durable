@@ -137,6 +137,9 @@ check("claude keeps permission mode",
 check("codex resume with model",
   cmd({ app = "codex", id = uuid, argv = { "codex", "-m", "gpt-5", "--full-auto" } }),
   "codex resume -m gpt-5 " .. uuid)
+check("codex --yolo kept on resume",
+  cmd({ app = "codex", id = uuid, argv = { "codex", "--yolo" } }),
+  "codex resume --yolo " .. uuid)
 check("quote spaces", M.join({ "cd", "/a b/it's" }), "cd '/a b/it'\\''s'")
 
 -- What a tab runs (process IDs above any real pid_max, so /proc never answers)
