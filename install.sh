@@ -100,6 +100,10 @@ if [ "$service" = 1 ]; then
     label=io.github.fazxes.rex-durable
     plist="$HOME/Library/LaunchAgents/$label.plist"
     mkdir -p "$HOME/Library/LaunchAgents" "$(dirname "$log")"
+    # Wait until the Rex server answers before starting the watcher. Started
+    # too early, it fails at once, and launchd holds it back for
+    # ThrottleInterval seconds. $0 is rex, $1 is the script (sh -c positional args).
+    wait_script='i=0; while [ $i -lt 60 ]; do "$0" --autostart=false server status >/dev/null 2>&1 && break; i=$((i+1)); sleep 0.2; done; exec "$0" --autostart=false do "$1" --all mode=watch "rex=$0" "script=$1"'
     cat >"$plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -108,14 +112,11 @@ if [ "$service" = 1 ]; then
   <key>Label</key><string>$label</string>
   <key>ProgramArguments</key>
   <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>$(xml "$wait_script")</string>
     <string>$(xml "$rex")</string>
-    <string>--autostart=false</string>
-    <string>do</string>
     <string>$(xml "$script")</string>
-    <string>--all</string>
-    <string>mode=watch</string>
-    <string>$(xml "rex=$rex")</string>
-    <string>$(xml "script=$script")</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict><key>PATH</key><string>$(xml "$service_path")</string></dict>
