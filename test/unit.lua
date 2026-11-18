@@ -28,6 +28,34 @@ local function check(name, got, want)
   end
 end
 
+-- Codex keeps no rollout open: its log database says which thread a process is on.
+do
+  local home = os.tmpname()
+  os.remove(home)
+  rex.exec({ "mkdir", "-p", home })
+  local A, B, SUB, OLD, C = "aaaaaaaa-0000-4000-8000-000000000001", "bbbbbbbb-0000-4000-8000-000000000002",
+    "cccccccc-0000-4000-8000-000000000003", "dddddddd-0000-4000-8000-000000000004",
+    "eeeeeeee-0000-4000-8000-000000000005"
+  rex.exec({ "sqlite3", home .. "/state_5.sqlite",
+    "create table threads (id text, source text);" ..
+    "insert into threads values ('" .. A .. "','cli'),('" .. B .. "','cli'),('" .. OLD .. "','cli'),('" .. C .. "','cli')," .. 
+    "('" .. SUB .. "','{\"subagent\":{}}');" })
+  rex.exec({ "sqlite3", home .. "/logs_2.sqlite",
+    "create table logs (ts integer, thread_id text, process_uuid text);" ..
+    "insert into logs values (50,'" .. OLD .. "','pid:7:x'),(100,'" .. A .. "','pid:7:x'),(300,'" .. SUB .. "','pid:7:x')," ..
+    "(400,'" .. B .. "','pid:8:y'),(200,'" .. A .. "','pid:77:z'),(500,'" .. C .. "','pid:77:z');" })
+  local function thread(pid, since)
+    local r = rex.exec({ "sqlite3", "-readonly", home .. "/logs_2.sqlite", M.codex_thread_query(home, pid, since) })
+    return (r.stdout:gsub("%s+$", ""))
+  end
+  check("codex thread: the newest user thread the process logged", thread(7, 0), A)
+  check("codex thread: another process's thread is not taken", thread(8, 0), B)
+  check("codex thread: pid 7 does not take pid 77's newer thread", thread(7, 0), A)
+  check("codex thread: pid 77 gets its own thread", thread(77, 0), C)
+  check("codex thread: lines from before the process started are ignored", thread(7, 150), "")
+  rex.exec({ "rm", "-rf", home })
+end
+
 -- No --sessions-v2 in this fx's help, like fx 0.0.16 and later.
 local function new_fx(_, option) return option ~= "--sessions-v2" end
 local function old_fx() return true end

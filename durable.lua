@@ -78,6 +78,7 @@ local UUID = "%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x
 
 local args = rex.args or {}
 local HOME = os.getenv("HOME") or ""
+local CODEX_HOME = (os.getenv("CODEX_HOME") or "") ~= "" and os.getenv("CODEX_HOME") or (HOME .. "/.codex")
 
 ---------------------------------------------------------------------------
 -- Small helpers
@@ -509,6 +510,29 @@ local function newest_session_file(pane, info)
   return best:match("%-(" .. UUID .. ")%.jsonl$"), best
 end
 
+-- Codex keeps no rollout open, but its log database tags each line with the
+-- process and thread, so a chat's conversation is the newest user thread its
+-- pid logged since it started. Subagents log under their parent's process
+-- too; their source names the parent, which the user's own threads don't.
+function M.codex_thread_query(home, pid, since)
+  return string.format(
+    "attach %s as s; select l.thread_id from logs l join s.threads t on t.id = l.thread_id " ..
+    "where l.process_uuid like 'pid:%d:%%' and l.ts >= %d and t.source not like '{%%' " ..
+    "group by l.thread_id order by max(l.ts) desc limit 1",
+    M.sql_quote(home .. "/state_5.sqlite"), pid, since)
+end
+
+function M.sql_quote(s) return "'" .. tostring(s):gsub("'", "''") .. "'" end
+
+local function codex_thread_of(pane, info)
+  if not pane.pid then return nil end
+  local since = info.now - ((info.ps[pane.pid] or {}).age or 0) - 5
+  local r = run({ "sqlite3", "-readonly", CODEX_HOME .. "/logs_2.sqlite", M.codex_thread_query(CODEX_HOME, pane.pid, since) },
+                { timeout = 5 })
+  local id = r and r.ok and (r.stdout:match("^%s*(.-)%s*$")) or ""
+  if id:match("^" .. UUID .. "$") then return id end
+end
+
 local function resolve_chats(pending, info)
   local groups = {}
   for _, pane in ipairs(pending) do
@@ -518,7 +542,8 @@ local function resolve_chats(pending, info)
   end
   for _, group in pairs(groups) do
     for _, pane in ipairs(group) do
-      if #group == 1 then pane.id, pane.session_file = newest_session_file(pane, info) end
+      if pane.app == "codex" then pane.id = codex_thread_of(pane, info) end
+      if not pane.id and #group == 1 then pane.id, pane.session_file = newest_session_file(pane, info) end
       if not pane.id then
         -- Not sure which conversation it is: bring it back typed, not run.
         pane.kind, pane.app, pane.session_file = "program", nil, nil
