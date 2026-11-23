@@ -403,6 +403,54 @@ function M.claude_session(files, home)
   end
 end
 
+local MONTHS = { Jan = 1, Feb = 2, Mar = 3, Apr = 4, May = 5, Jun = 6,
+                 Jul = 7, Aug = 8, Sep = 9, Oct = 10, Nov = 11, Dec = 12 }
+
+-- Seconds since 1970 for a UTC time written like "Sun Nov 22 21:40:38 2026".
+function M.parse_utc(text)
+  local mon, day, hour, min, sec, year = tostring(text or ""):match(
+    "^%a+%s+(%a+)%s+(%d+)%s+(%d+):(%d+):(%d+)%s+(%d+)$")
+  if not MONTHS[mon or ""] then return nil end
+  local t = { year = tonumber(year), month = MONTHS[mon], day = tonumber(day),
+              hour = tonumber(hour), min = tonumber(min), sec = tonumber(sec), isdst = false }
+  if t.day < 1 or t.day > 31 or t.hour > 23 or t.min > 59 or t.sec > 60 then return nil end
+  -- os.time reads a table as local time. Both calls use standard time
+  -- (isdst = false), so the offset is exact, also in summer.
+  local now = os.time()
+  local utc_now = os.date("!*t", now)
+  utc_now.isdst = false
+  return os.time(t) + os.difftime(now, os.time(utc_now))
+end
+
+-- Claude Code writes ~/.claude/sessions/<pid>.json while it runs. It names the
+-- session the chat is on now, also after /clear or /resume, so it tells apart
+-- chats that share a folder. The format isn't documented, so its ID is used
+-- only when the file is about this very process: same pid, and a start time
+-- within a few seconds of ps's (procStart, which is UTC, or else startedAt).
+local START_SLACK = 3        -- seconds between the file's start time and ps's
+local REGISTER_WINDOW = 120  -- seconds after start that startedAt may be
+
+function M.claude_pid_session(pid, started, home, reader)
+  pid = tonumber(pid)
+  if not pid or not started then return nil end
+  local text = (reader or read_file)((home or HOME) .. "/.claude/sessions/" .. pid .. ".json")
+  if type(text) ~= "string" or #text > 65536 then return nil end
+  local ok, d = pcall(rex.json.decode, text)
+  if not ok or type(d) ~= "table" or tonumber(d.pid) ~= pid then return nil end
+  local id = type(d.sessionId) == "string" and d.sessionId:match("^" .. UUID .. "$")
+  if not id then return nil end
+  local proc_start = M.parse_utc(d.procStart)
+  if proc_start then
+    if math.abs(proc_start - started) > START_SLACK then return nil end
+  elseif type(d.startedAt) == "number" then
+    local at = d.startedAt / 1000
+    if at < started - START_SLACK or at > started + REGISTER_WINDOW then return nil end
+  else
+    return nil
+  end
+  return id
+end
+
 -- A session ID given on the command line: `codex resume <id>`,
 -- `claude --resume <id>` or `claude --session-id <id>`.
 function M.argv_session(app, argv)
@@ -446,7 +494,13 @@ local function chat_in(p, info)
   for _, app in ipairs({ "claude", "codex" }) do
     if M.is_app(app, name, argv) then
       local found, file
-      if app == "claude" then found, file = M.claude_session(files) else found, file = M.codex_session(files) end
+      if app == "claude" then
+        local age = (info.ps[p.pid] or {}).age
+        if age and info.now then found = M.claude_pid_session(p.pid, info.now - age) end
+        if not found then found, file = M.claude_session(files) end
+      else
+        found, file = M.codex_session(files)
+      end
       return { kind = "chat", app = app, id = found or M.argv_session(app, argv),
                session_file = file, argv = argv, pid = p.pid }
     end

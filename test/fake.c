@@ -6,6 +6,10 @@
  *   codex   holds FAKE_HOME/.codex/sessions/.../rollout-<time>-<id>.jsonl open
  *   claude  writes FAKE_HOME/.claude/projects/<folder>/<id>.jsonl and closes it
  *
+ * With --write-pid-file, claude also writes FAKE_HOME/.claude/sessions/<pid>.json
+ * like Claude Code 2.1, with procStart in UTC. --switch-to <id> puts another
+ * session in that file, like /clear or /resume inside the chat.
+ *
  * Built by test/e2e.sh with -DAPP="fx" (or claude, codex) and -DFAKE_HOME.
  */
 #include <ctype.h>
@@ -13,6 +17,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 static void make_dirs(const char *path) {
@@ -39,8 +44,18 @@ static void write_new(const char *path, const char *line) {
 
 int main(int argc, char **argv) {
   const char *app = APP;
-  char id[128] = "", child[128] = "";
+  char id[128] = "", child[128] = "", switch_to[128] = "";
+  int write_pid_file = 0;
+  time_t started = time(NULL);
   for (int i = 1; i < argc; i++) {
+    if (!strcmp(argv[i], "--write-pid-file")) {
+      write_pid_file = 1;
+      continue;
+    }
+    if (!strcmp(argv[i], "--switch-to") && i + 1 < argc) {
+      snprintf(switch_to, sizeof switch_to, "%s", argv[++i]);
+      continue;
+    }
     if (!strcmp(argv[i], "--child") && i + 1 < argc) {
       snprintf(child, sizeof child, "%s", argv[++i]);
       continue;
@@ -102,6 +117,20 @@ int main(int argc, char **argv) {
                    "{\"type\":\"session_meta\",\"payload\":{\"id\":\"%s\",\"cwd\":\"%s\"}}\n", id, cwd);
   if (write(fd, line, (size_t)n) != n) return 1;
   if (!keep_open) close(fd);
+  if (!strcmp(app, "claude") && write_pid_file) {
+    char sdir[4096], sfile[4608], when[64], body[4096];
+    strftime(when, sizeof when, "%a %b %d %H:%M:%S %Y", gmtime(&started));
+    snprintf(sdir, sizeof sdir, "%s/.claude/sessions", FAKE_HOME);
+    make_dirs(sdir);
+    snprintf(sfile, sizeof sfile, "%s/%d.json", sdir, (int)getpid());
+    int m = snprintf(body, sizeof body,
+                     "{\"pid\":%d,\"sessionId\":\"%s\",\"cwd\":\"%s\",\"procStart\":\"%s\","
+                     "\"startedAt\":%lld,\"version\":\"fake\"}\n",
+                     (int)getpid(), switch_to[0] ? switch_to : id, cwd, when, (long long)started * 1000);
+    int sfd = open(sfile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (sfd < 0 || write(sfd, body, (size_t)m) != m) return 1;
+    close(sfd);
+  }
   printf("fake %s on %s\n", app, id);
   fflush(stdout);
   for (;;) pause();
