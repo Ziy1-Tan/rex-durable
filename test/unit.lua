@@ -122,6 +122,33 @@ check("pi slug, : as - like pi", M.pi_slug("/Users/me/a:b"), "--Users-me-a-b--")
 check("pi --session", M.argv_session("pi", { "pi", "--session", pi_id }), pi_id)
 check("pi --session-id", M.argv_session("pi", { "pi", "--session-id", pi_id }), pi_id)
 check("pi --session wants a UUID", M.argv_session("pi", { "pi", "--session", "latest" }), nil)
+
+-- ~/.claude/sessions/<pid>.json
+check("procStart is UTC", M.parse_utc("Sun Nov 22 21:40:38 2026"), 1795383638)
+check("procStart with a padded day", M.parse_utc("Mon Nov  2 01:02:03 2026"), 1793581323)
+check("procStart that isn't a date", M.parse_utc("yesterday"), nil)
+check("procStart with a month that doesn't exist", M.parse_utc("Sun Foo 22 21:40:38 2026"), nil)
+local started = 1795383638
+local function pid_file(body)
+  return function(path) if path == HOME .. "/.claude/sessions/63279.json" then return body end end
+end
+local function claude_file(fields) return pid_file('{"pid":63279,"sessionId":"' .. uuid .. '"' .. fields .. "}") end
+local proc_start = ',"procStart":"Sun Nov 22 21:40:38 2026"'
+check("claude pid file", M.claude_pid_session(63279, started + 1, nil, claude_file(proc_start)), uuid)
+check("claude pid file, ps a little behind", M.claude_pid_session(63279, started - 2, nil, claude_file(proc_start)), uuid)
+check("claude pid file of an older process with the same pid",
+  M.claude_pid_session(63279, started + 600, nil, claude_file(proc_start)), nil)
+check("claude pid file that names another pid",
+  M.claude_pid_session(63280, started, nil, function() return '{"pid":63279,"sessionId":"' .. uuid .. '"' .. proc_start .. "}" end), nil)
+check("claude pid file with only startedAt",
+  M.claude_pid_session(63279, started, nil, claude_file(string.format(',"startedAt":%d', (started + 1) * 1000))), uuid)
+check("claude pid file with a late startedAt",
+  M.claude_pid_session(63279, started, nil, claude_file(string.format(',"startedAt":%d', (started + 900) * 1000))), nil)
+check("claude pid file with no start time", M.claude_pid_session(63279, started, nil, claude_file("")), nil)
+check("claude pid file that isn't JSON", M.claude_pid_session(63279, started, nil, pid_file("{not json")), nil)
+check("claude pid file with a bad session ID", M.claude_pid_session(63279, started, nil,
+  pid_file('{"pid":63279,"sessionId":"../../etc/passwd"' .. proc_start .. "}")), nil)
+check("no claude pid file", M.claude_pid_session(63279, started, nil, function() return nil end), nil)
 check("claude via node", M.is_app("claude", "node", { "node", "/usr/local/bin/claude" }), true)
 check("codex binary", M.is_app("codex", "codex", { "/opt/homebrew/bin/codex" }), true)
 check("not claude", M.is_app("claude", "node", { "node", "server.js" }), false)

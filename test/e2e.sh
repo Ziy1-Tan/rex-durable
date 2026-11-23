@@ -339,6 +339,30 @@ D mode=repair from=pi-before-close >"$T/repair-double.log" 2>&1 || echo "  repai
 sleep 3
 expect "after repair: no second pi on that session" test "$(pis)" = "$before"
 
+echo "12. Claude chats that share a folder each come back on their own conversation"
+OLD_ID=aaaaaaaa-1111-4222-8333-444444444444
+NEW_ID=bbbbbbbb-5555-4666-8777-888888888888
+HOME="$H" R do "$here/test/e2e_more.lua" action=claudes "bin=$T/bin" "dir=$T/my proj" \
+  "old=$OLD_ID" "new=$NEW_ID" >/dev/null
+sleep 2
+D mode=save
+listing=$(show)
+pair_id() { printf '%s\n' "$listing" | awk -v tab="$1" '$1 == "pair" && $2 == tab && $3 == "chat" { print $5 }'; }
+A_ID=$(pair_id 1.1)
+B_ID=$(pair_id 2.1)
+expect "first new chat found by its pid file" has_line '^pair 1\.1 chat claude 00000000-0000-4000-8000-'
+expect "second new chat in the same folder found too" has_line '^pair 2\.1 chat claude 00000000-0000-4000-8000-'
+expect "the two chats are told apart" test "$A_ID" != "$B_ID"
+expect "a chat that switched sessions is saved on the new one" has_line "^pair 3\.1 chat claude $NEW_ID "
+stop_server
+start_server
+D mode=startup >"$T/startup-pair.log"
+sleep 3
+expect "restart: first chat reopened on its conversation" grep -q "claude --resume $A_ID (run)" "$T/startup-pair.log"
+expect "restart: second chat reopened on its conversation" grep -q "claude --resume $B_ID (run)" "$T/startup-pair.log"
+expect "restart: switched chat reopened on the new session" grep -q "claude --resume $NEW_ID (run)" "$T/startup-pair.log"
+expect "one copy of each of them" test "$(running "$T/bin/claude --resume $A_ID")$(running "$T/bin/claude --resume $B_ID")$(running "$T/bin/claude --resume $NEW_ID")" = 111
+
 echo
 echo "$passed passed, $failed failed"
 [ "$failed" = 0 ]
