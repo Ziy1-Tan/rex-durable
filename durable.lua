@@ -387,35 +387,28 @@ function M.fx_session(files, home, reader)
   return id, "v2"
 end
 
--- Codex writes ~/.codex/sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl.
-local function session_in(files, dir, pattern, home)
+-- Where each chat writes its session, under the home folder.
+local SESSION_FILES = {
+  codex = { dir = "/.codex/sessions/", id = "rollout%-.*%-(" .. UUID .. ")%.jsonl$" },
+  claude = { dir = "/.claude/projects/", id = "/(" .. UUID .. ")%.jsonl$" },
+  pi = { dir = "/.pi/agent/sessions/", id = "_(" .. UUID .. ")%.jsonl$" },
+}
+
+function M.session_file(app, files, home)
+  local where = SESSION_FILES[app]
   for _, f in ipairs(list(files)) do
-    if under(f, (home or HOME) .. dir) then
-      local id = f:match(pattern)
+    if under(f, (home or HOME) .. where.dir) then
+      local id = f:match(where.id)
       if id then return id, f end
     end
   end
 end
 
-function M.codex_session(files, home)
-  return session_in(files, "/.codex/sessions/", "rollout%-.*%-(" .. UUID .. ")%.jsonl$", home)
-end
-
--- Claude Code writes ~/.claude/projects/<folder with non-alphanumerics as ->/<id>.jsonl.
+-- Claude Code names its folder with non-alphanumerics as -.
 function M.claude_slug(cwd) return (tostring(cwd or ""):gsub("[^%w]", "-")) end
 
--- pi writes ~/.pi/agent/sessions/--<folder with / as ->--/<time>_<id>.jsonl.
-function M.pi_slug(cwd) return "--" .. (tostring(cwd or ""):gsub("^/", ""):gsub("/", "-")) .. "--" end
-
-function M.claude_session(files, home)
-  return session_in(files, "/.claude/projects/", "/(" .. UUID .. ")%.jsonl$", home)
-end
-
--- Claude and pi keep no lock on their session file, so the open-file check
--- cannot see them; that is why open_chats skips them.
-function M.pi_session(files, home)
-  return session_in(files, "/.pi/agent/sessions/", "_(" .. UUID .. ")%.jsonl$", home)
-end
+-- pi names its folder --<folder>-- with /, \ and : as - (getDefaultSessionDirPath).
+function M.pi_slug(cwd) return "--" .. (tostring(cwd or ""):gsub("^/", ""):gsub("[/\\:]", "-")) .. "--" end
 
 -- A session ID given on the command line: `codex resume <id>`,
 -- `claude --resume <id>`, `claude --session-id <id>` or `pi --session <id>`.
@@ -460,10 +453,7 @@ local function chat_in(p, info)
   if id then return { kind = "chat", app = "fx", id = id, store = store, argv = argv } end
   for _, app in ipairs({ "claude", "codex", "pi" }) do
     if M.is_app(app, name, argv) then
-      local found, file
-      if app == "claude" then found, file = M.claude_session(files)
-      elseif app == "pi" then found, file = M.pi_session(files)
-      else found, file = M.codex_session(files) end
+      local found, file = M.session_file(app, files)
       return { kind = "chat", app = app, id = found or M.argv_session(app, argv),
                session_file = file, argv = argv, pid = p.pid }
     end
@@ -508,10 +498,9 @@ local function newest_session_file(pane, info)
   local age = (info.ps[pane.pid] or {}).age or 0
   local since = info.now - age - 5
   local candidates = {}
-  if pane.app == "claude" then
-    candidates = list_dir(HOME .. "/.claude/projects/" .. M.claude_slug(pane.cwd), ".jsonl")
-  elseif pane.app == "pi" then
-    candidates = list_dir(HOME .. "/.pi/agent/sessions/" .. M.pi_slug(pane.cwd), ".jsonl")
+  if pane.app == "claude" or pane.app == "pi" then
+    local slug = pane.app == "claude" and M.claude_slug(pane.cwd) or M.pi_slug(pane.cwd)
+    candidates = list_dir(HOME .. SESSION_FILES[pane.app].dir .. slug, ".jsonl")
   else
     local minutes = tostring(math.floor(age / 60) + 2)
     for _, path in ipairs(lines(stdout_of({ "find", HOME .. "/.codex/sessions", "-name",
@@ -524,9 +513,7 @@ local function newest_session_file(pane, info)
     if t >= since and (not best_time or t > best_time) then best, best_time = path, t end
   end
   if not best then return nil end
-  if pane.app == "claude" then return best:match("/(" .. UUID .. ")%.jsonl$"), best end
-  if pane.app == "pi" then return best:match("_(" .. UUID .. ")%.jsonl$"), best end
-  return best:match("%-(" .. UUID .. ")%.jsonl$"), best
+  return best:match(SESSION_FILES[pane.app].id), best
 end
 
 local function resolve_chats(pending, info)
@@ -556,6 +543,7 @@ local function resolve_chats(pending, info)
       end
       if not pane.id then
         -- Not sure which conversation it is: bring it back typed, not run.
+        pane.unknown_app = pane.app
         pane.kind, pane.app, pane.session_file = "program", nil, nil
         pane.note = "conversation unknown"
       end
@@ -886,8 +874,14 @@ function M.resume_argv(pane, accepts)
   return argv
 end
 
-local function command_for(pane)
-  if pane.kind == "chat" then return M.join(M.resume_argv(pane)) .. "\n" end
+-- pi keeps no lock, so a pi whose session isn't known may be this very chat:
+-- then the chat is typed, not run, and two pi never write one session.
+local function command_for(pane, open)
+  if pane.kind == "chat" then
+    local command = M.join(M.resume_argv(pane))
+    if pane.app == "pi" and open.unknown_pi then return command end
+    return command .. "\n"
+  end
   if pane.kind == "program" and #list(pane.argv) > 0 then return M.join(pane.argv) end
 end
 
@@ -898,6 +892,7 @@ local function open_chats(saved, live)
     for _, w in ipairs(list(s.windows)) do
       for _, p in ipairs(M.panes(w.layout)) do
         if p.kind == "chat" then open[p.app .. ":" .. p.id] = true end
+        if p.unknown_app == "pi" then open.unknown_pi = true end
       end
     end
   end
@@ -911,6 +906,7 @@ local function open_chats(saved, live)
             path = HOME .. "/.fx/sessions/" ..
               (p.store == "v2" and ("v2/" .. p.id .. "/lock") or (p.id .. "/session.lock"))
           end
+          -- Claude and pi hold no file open, so only the tabs show them.
           if path and p.app ~= "claude" and p.app ~= "pi" then
             paths[#paths + 1] = path
             owner[path] = p.app .. ":" .. p.id
@@ -963,7 +959,7 @@ function M.plan_reopen(saved, live, open, opts)
       for pi, p in ipairs(want) do
         local where = string.format("%s tab %d", s.label or "session", wi)
         if #want > 1 then where = where .. string.format(" pane %d", pi) end
-        local command = command_for(p)
+        local command = command_for(p, open)
         if command and (p.kind == "chat" or opts.programs ~= false) then
           local hit = by_block[p.block_id]
           local have, session_id = hit and hit.pane, hit and hit.session.session_id
@@ -1002,6 +998,7 @@ local function perform(writes)
   local done = 0
   for _, w in ipairs(writes) do
     rex.session.attach{ session_id = w.session_id }
+    w.at = os.time()
     local ok, err = rex.block.call(TERMINAL, "write",
       { session_id = w.session_id, block_id = w.block_id, data = w.data })
     if ok then done = done + 1 else log(w.where .. ": couldn't type into the tab: " .. tostring(err)) end
@@ -1038,17 +1035,28 @@ local function reopen(saved, live, dry_run, tries)
     end
     if not dry_run then
       perform(writes)
+      -- An idle pi is known only by what was typed into its tab: keep that
+      -- for tabs that are still there.
       local state = read_json(STATE_FILE) or {}
-      if try == 1 then state.reopened = {} end
+      local reopened = state.reopened or {}
+      local blocks = {}
+      for _, s in ipairs(list(live.sessions)) do
+        for _, lw in ipairs(list(s.windows)) do
+          for _, p in ipairs(M.panes(lw.layout)) do blocks[p.block_id] = true end
+        end
+      end
+      for block_id in pairs(reopened) do
+        if not blocks[block_id] then reopened[block_id] = nil end
+      end
       for _, w in ipairs(writes) do
         written[w.block_id] = true
         if w.key then
           typed[w.key] = true
           local app, id = w.key:match("^([^:]+):(.+)$")
-          state.reopened = state.reopened or {}
-          state.reopened[w.block_id] = { app = app, id = id, at = os.time() }
+          reopened[w.block_id] = { app = app, id = id, at = w.at }
         end
       end
+      state.reopened = reopened
       write_json(STATE_FILE, state)
       chats = chats + count_kind(writes, "chat")
       programs = programs + count_kind(writes, "program")
@@ -1066,11 +1074,11 @@ end
 ---------------------------------------------------------------------------
 -- Rebuilding sessions on a server that has none
 
-local function create_layout(node, open, leaves)
+local function create_layout(node, open, leaves, typed)
   if node.split then
     return { split = { direction = node.split.direction, ratio = node.split.ratio,
-                       before = create_layout(node.split.before, open, leaves),
-                       after = create_layout(node.split.after, open, leaves) } }
+                       before = create_layout(node.split.before, open, leaves, typed),
+                       after = create_layout(node.split.after, open, leaves, typed) } }
   end
   local p = node.pane
   leaves[#leaves + 1] = p
@@ -1078,24 +1086,37 @@ local function create_layout(node, open, leaves)
   if p.cwd and dir_exists(p.cwd) then options.cwd = p.cwd end
   local key = p.kind == "chat" and (p.app .. ":" .. p.id)
   if not (key and open[key]) then
-    local command = command_for(p)
+    local command = command_for(p, open)
     if command and (p.kind == "chat" or args.programs ~= false) then options.initial_input = command end
-    if key then open[key] = true end
+    if key then
+      open[key] = true
+      typed[#leaves] = { app = p.app, id = p.id }
+    end
   end
   local block = { flavor = SHELL_FLAVOR }
   if next(options) then block.options = options end
   return { block = block }
 end
 
--- Create one saved session, with all its windows. Returns its new ID.
-local function rebuild_session(s, open)
-  local windows, leaves_by_window = {}, {}
-  for i, w in ipairs(s.windows) do
-    local leaves = {}
-    local window = { layout = create_layout(w.layout, open, leaves) }
-    if w.label then window.label = w.label end
-    windows[i], leaves_by_window[i] = window, leaves
+-- Like reopen, for new tabs. Rex returns block_ids in the order of the leaves.
+local function remember_typed(state, block_ids, typed, at)
+  state.reopened = state.reopened or {}
+  for i, block_id in ipairs(list(block_ids)) do
+    local t = typed[i]
+    if t then state.reopened[block_id] = { app = t.app, id = t.id, at = at } end
   end
+end
+
+-- Create one saved session, with all its windows. Returns its new ID.
+local function rebuild_session(s, open, state)
+  local windows, leaves_by_window, typed_by_window = {}, {}, {}
+  for i, w in ipairs(s.windows) do
+    local leaves, typed = {}, {}
+    local window = { layout = create_layout(w.layout, open, leaves, typed) }
+    if w.label then window.label = w.label end
+    windows[i], leaves_by_window[i], typed_by_window[i] = window, leaves, typed
+  end
+  local at = os.time()
   local request = { initial_windows = windows }
   if s.label then request.label = s.label end
   local result, err = rex.call("session.create", request)
@@ -1106,6 +1127,9 @@ local function rebuild_session(s, open)
   end
   if result then
     log("  rebuilt session " .. tostring(s.label))
+    for i, made_window in ipairs(list(result.initial_windows)) do
+      remember_typed(state, made_window.block_ids, typed_by_window[i] or {}, at)
+    end
     rex.session.attach{ session_id = result.session_id }
     -- Focus each window's focused pane, then the window that was active.
     local active_block
@@ -1129,12 +1153,14 @@ end
 
 local function rebuild(saved, live)
   local open = open_chats(saved, live)
+  local state = read_json(STATE_FILE) or {}
   local made = 0
   for _, s in ipairs(list(saved.sessions)) do
-    if not M.is_default_session(s) and #list(s.windows) > 0 and rebuild_session(s, open) then
+    if not M.is_default_session(s) and #list(s.windows) > 0 and rebuild_session(s, open, state) then
       made = made + 1
     end
   end
+  write_json(STATE_FILE, state)
   return made
 end
 
@@ -1229,7 +1255,7 @@ local function repair(saved, dry_run)
       log(string.format("  %s session %s (%d tabs)", dry_run and "would rebuild" or "rebuild",
                         tostring(a.saved.label), #list(a.saved.windows)))
       if not dry_run then
-        local new_id, result = rebuild_session(a.saved, open)
+        local new_id, result = rebuild_session(a.saved, open, state)
         if new_id then
           sessions = sessions + 1
           state.repaired[a.saved.session_id] = new_id
@@ -1245,12 +1271,15 @@ local function repair(saved, dry_run)
       log(string.format("  %s %s tab %d", dry_run and "would add" or "add", tostring(a.label), a.index))
       if not dry_run then
         rex.session.attach{ session_id = a.session_id }
-        local layout = create_layout(a.saved.layout, open, {})
+        local typed = {}
+        local layout = create_layout(a.saved.layout, open, {}, typed)
         local request = { session_id = a.session_id, layout = layout, focus = false }
         if a.saved.label then request.window_label = a.saved.label end
+        local at = os.time()
         local result, err = rex.call("session.new_window", request)
         if result then
           tabs = tabs + 1
+          remember_typed(state, result.block_ids, typed, at)
           made[a.session_id] = made[a.session_id] or {}
           made[a.session_id][a.index] = result.window_id
           if a.saved.window_id then state.repaired[a.saved.window_id] = result.window_id end

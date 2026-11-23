@@ -7,7 +7,7 @@
  *   claude  writes FAKE_HOME/.claude/projects/<folder>/<id>.jsonl and closes it
  *   pi      writes nothing and blanks its arguments, as pi on --session does
  *
- * Built by test/e2e.sh with -DAPP="fx" (or claude, codex) and -DFAKE_HOME.
+ * Built by test/e2e.sh with -DAPP="fx" (or claude, codex, pi) and -DFAKE_HOME.
  */
 #include <ctype.h>
 #include <fcntl.h>

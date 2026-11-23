@@ -6,7 +6,7 @@
 #   REX=/path/to/rex test/e2e.sh
 #
 # It runs its own Rex server on its own socket and state folder, with fake
-# fx, Claude Code, and Codex chats that keep their files in a throwaway home
+# fx, Claude Code, Codex, and pi chats that keep their files in a throwaway home
 # folder. It never connects to your own Rex server or touches your real chats,
 # and it stops only the server it started, by its process ID.
 set -euo pipefail
@@ -278,6 +278,66 @@ for round in 1 2; do
   expect "restart $round: the save still knows its session" has_line "^work $pi_pos chat pi $PI_ID "
 done
 expect "one copy of the pi chat" test "$(pgrep -f "$T/bin/pi" | wc -l | tr -d ' ')" = 1
+
+echo "9. Repair after a restart keeps the idle pi chat's session"
+D mode=repair >"$T/repair-pi.log" 2>&1
+sleep 1
+D mode=save
+listing=$(show)
+expect "after repair: the save still knows the pi session" has_line "^work $pi_pos chat pi $PI_ID "
+
+echo "10. A pi typed before many other tabs is still known after a restart"
+PI2_ID=33333333-4444-4555-8666-777777777777
+mkdir -p "$T/other proj"
+pi2_dir="$H/.pi/agent/sessions/--$(printf '%s' "${T#/}/other proj" | tr '/' '-')--"
+mkdir -p "$pi2_dir"
+: >"$pi2_dir/2026-11-17T00-00-00-000Z_$PI2_ID.jsonl"
+new_tab() { # folder -> block ID of a new tab at the end of session work
+  local w
+  w=$(R window new -s work -c "$1" --focus=false --json | jq -r .window_id)
+  sleep 1
+  R window ls -s work --json | jq -r --arg w "$w" '.windows[] | select(.window_id == $w) | .focused_block_id'
+}
+type_in() { # block ID, command
+  R do -s work -e "rex.block.call('com.superlogical.terminal', 'write', \
+    { block_id = '$1', data = [[$2]] .. '\n' }) return 'ok'" >/dev/null
+}
+pi2_tab=$(new_tab "$T/other proj")
+type_in "$pi2_tab" "'$T/bin/pi' --session $PI2_ID"
+sleep 1
+touch "$pi2_dir/2026-11-17T00-00-00-000Z_$PI2_ID.jsonl"
+for n in $(seq 1 16); do type_in "$(new_tab "$T")" "'$T/bin/fx' --resume FILL$n"; done
+sleep 2
+D mode=save
+listing=$(show)
+pi2_pos=$(printf '%s\n' "$listing" | awk -v b="$pi2_tab" '$NF == b { print $2 }')
+expect "second pi found by its new session file" has_line "^work $pi2_pos chat pi $PI2_ID "
+expect "16 more chats saved after it" test "$(printf '%s\n' "$listing" | grep -c ' chat fx FILL')" = 16
+stop_server
+start_server
+D mode=startup >"$T/startup-many.log"
+sleep 3
+D mode=save
+listing=$(show)
+echo "  typed in one try: $(grep -c ' type ' "$T/startup-many.log") tabs"
+expect "many tabs: pi reopened on its session" grep -q "pi --session $PI2_ID (run)" "$T/startup-many.log"
+expect "many tabs: the save still knows the pi session" has_line "^work $pi2_pos chat pi $PI2_ID "
+
+echo "11. A pi resumed by hand in another tab is not opened twice by repair"
+pis() { pgrep -f "$T/bin/pi" | wc -l | tr -d ' '; }
+work_id=$(R ls --json | jq -r '(.sessions // .)[] | select(.label == "work") | .session_id')
+before=$(pis)
+# Keep the layout with the pi tab, then close that tab.
+D mode=checkpoint name=pi-before-close >/dev/null
+R do -s work -e "rex.call('session.close_window', { session_id = '$work_id', window_id = '$pi_window' }) return 'ok'" >/dev/null
+sleep 2
+expect "the closed tab's pi stopped" test "$(pis)" = "$((before - 1))"
+# Resume the same pi session by hand in another tab, then repair.
+type_in "$(new_tab "$T/my proj")" "'$T/bin/pi' --session $PI_ID"
+sleep 2
+D mode=repair from=pi-before-close >"$T/repair-double.log" 2>&1 || echo "  repair failed: exit $?"
+sleep 3
+expect "after repair: no second pi on that session" test "$(pis)" = "$before"
 
 echo
 echo "$passed passed, $failed failed"
